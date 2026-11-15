@@ -3,7 +3,7 @@
 {% block content %}
 <div class="card empty">
   <h1>{{ title or "404 · 未找到" }}</h1>
-  <p>{{ message or "请求的页面或已发布版本不存在。" }}</p>
+  <p>{{ message or "请求的页面或已发布版本不存在，可能尚未发布或已被撤回。" }}</p>
   <p><a class="btn secondary" href="{{ url_for('public.index') }}">返回已发布数据</a></p>
 </div>
 {% endblock %}

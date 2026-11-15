@@ -244,6 +244,12 @@ def candidate_detail(version_id: int):
     ).fetchone()
     current_published = services.get_current_published(conn, version["dataset_date"])
     conflict = latest is not None and int(latest) > version["version_no"]
+    withdrawal = services.get_withdrawal(conn, version_id)
+    withdrawal_blocked = (
+        version["status"] == "candidate"
+        and services.withdrawal_counter(conn, version["dataset_date"])
+        != version["withdrawal_seq"]
+    )
     return render_template(
         "admin/candidate_detail.html",
         version=version,
@@ -251,6 +257,8 @@ def candidate_detail(version_id: int):
         conflict=conflict,
         newer=newer,
         current_published=current_published,
+        withdrawal=withdrawal,
+        withdrawal_blocked=withdrawal_blocked,
     )
 
 
@@ -276,10 +284,35 @@ def publish(version_id: int):
     if outcome.status == "already_published":
         flash(outcome.message, "info")
         return redirect(url_for("public.version_detail", version_id=version_id))
+    if outcome.status == "withdrawn":
+        flash(outcome.message, "error")
+        return redirect(url_for("admin.candidate_detail", version_id=version_id))
     if outcome.status == "not_found":
         abort(404)
 
     flash(outcome.message or "发布失败。", "error")
+    return redirect(url_for("admin.candidate_detail", version_id=version_id))
+
+
+@admin_bp.post("/versions/<int:version_id>/withdraw")
+def withdraw(version_id: int):
+    _check_csrf()
+    conn = get_db()
+    reason = request.form.get("reason", "")
+    outcome = services.withdraw_version(conn, version_id, reason)
+    if outcome.status == "withdrawn":
+        flash(outcome.message, "success")
+        return redirect(url_for("public.index"))
+    if outcome.status == "not_found":
+        abort(404)
+    if outcome.status == "already_withdrawn":
+        flash(outcome.message, "info")
+        return redirect(url_for("admin.candidate_detail", version_id=version_id))
+    if outcome.status == "reason_required" or outcome.status == "reason_too_long":
+        flash(outcome.message, "error")
+        return redirect(url_for("admin.candidate_detail", version_id=version_id))
+
+    flash(outcome.message or "撤回失败。", "error")
     return redirect(url_for("admin.candidate_detail", version_id=version_id))
 
 

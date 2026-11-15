@@ -9,13 +9,13 @@ from typing import Iterator
 
 from flask import current_app, g
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS versions (
+VERSIONS_TABLE_DDL = """
+CREATE TABLE {name} (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     dataset_date      TEXT    NOT NULL,
     version_no        INTEGER NOT NULL,
     status            TEXT    NOT NULL DEFAULT 'candidate'
-                              CHECK (status IN ('candidate', 'published', 'superseded')),
+                              CHECK (status IN ('candidate', 'published', 'superseded', 'withdrawn')),
     original_filename TEXT    NOT NULL,
     stored_path       TEXT    NOT NULL,
     sha256            TEXT    NOT NULL,
@@ -24,8 +24,75 @@ CREATE TABLE IF NOT EXISTS versions (
     created_at        TEXT    NOT NULL,
     published_at      TEXT,
     superseded_at     TEXT,
+    withdrawn_at      TEXT,
+    withdrawal_reason TEXT,
+    -- Highest withdrawal audit id that existed when this version was created.
+    -- A candidate may only be published while the date's current withdrawal
+    -- counter still equals this value, so pre-withdrawal candidates can never
+    -- bring a withdrawn date back online.
+    withdrawal_seq    INTEGER NOT NULL DEFAULT 0,
     UNIQUE (dataset_date, version_no)
-);
+)
+"""
+
+VERSIONS_COLUMNS = (
+    "id",
+    "dataset_date",
+    "version_no",
+    "status",
+    "original_filename",
+    "stored_path",
+    "sha256",
+    "size_bytes",
+    "row_count",
+    "created_at",
+    "published_at",
+    "superseded_at",
+)
+
+VERSIONS_BODY = """
+(
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_date      TEXT    NOT NULL,
+    version_no        INTEGER NOT NULL,
+    status            TEXT    NOT NULL DEFAULT 'candidate'
+                              CHECK (status IN ('candidate', 'published', 'superseded', 'withdrawn')),
+    original_filename TEXT    NOT NULL,
+    stored_path       TEXT    NOT NULL,
+    sha256            TEXT    NOT NULL,
+    size_bytes        INTEGER NOT NULL,
+    row_count         INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL,
+    published_at      TEXT,
+    superseded_at     TEXT,
+    withdrawn_at      TEXT,
+    withdrawal_reason TEXT,
+    -- Highest withdrawal audit id that existed when this version was created.
+    -- A candidate may only be published while the date's current withdrawal
+    -- counter still equals this value, so pre-withdrawal candidates can never
+    -- bring a withdrawn date back online.
+    withdrawal_seq    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (dataset_date, version_no)
+)
+"""
+
+VERSIONS_COLUMNS = (
+    "id",
+    "dataset_date",
+    "version_no",
+    "status",
+    "original_filename",
+    "stored_path",
+    "sha256",
+    "size_bytes",
+    "row_count",
+    "created_at",
+    "published_at",
+    "superseded_at",
+)
+
+SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS versions {VERSIONS_BODY};
 
 CREATE INDEX IF NOT EXISTS idx_versions_date_status
     ON versions (dataset_date, status, version_no DESC);
@@ -45,6 +112,19 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_observations_version
     ON observations (version_id);
+
+-- One audit row per withdrawn version.  A version can be withdrawn at most
+-- once, so repeated withdrawal requests leave no additional record.
+CREATE TABLE IF NOT EXISTS withdrawals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id   INTEGER NOT NULL UNIQUE REFERENCES versions(id) ON DELETE CASCADE,
+    dataset_date TEXT    NOT NULL,
+    reason       TEXT    NOT NULL,
+    withdrawn_at TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_withdrawals_date
+    ON withdrawals (dataset_date, id);
 """
 
 
@@ -64,6 +144,75 @@ def connect(database: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def _versions_table_needs_migration(conn: sqlite3.Connection) -> bool:
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(versions)").fetchall()
+    }
+    return "withdrawn_at" not in columns
+
+
+def _migrate_versions_table(conn: sqlite3.Connection) -> None:
+    """Rebuild the versions table on databases created before withdrawals.
+
+    SQLite cannot widen a CHECK constraint in place, and the new status /
+    audit columns must not be lost.  The table is copied under the same name
+    so observations keep referencing it.
+    """
+    old_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(versions)").fetchall()
+    }
+    copied = [name for name in VERSIONS_COLUMNS if name in old_columns]
+    new_only = {
+        "withdrawn_at": "NULL",
+        "withdrawal_reason": "NULL",
+        "withdrawal_seq": "0",
+    }
+    # foreign_keys cannot change inside a transaction; disable it first.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # Another worker may have completed the migration while this one was
+        # waiting for the write lock.  Deciding again under the lock keeps us
+        # from dropping the freshly migrated table's data.
+        if not _versions_table_needs_migration(conn):
+            conn.commit()
+            return
+        conn.execute("DROP TABLE IF EXISTS versions_withdrawal_migration")
+        conn.execute(
+            f"CREATE TABLE versions_withdrawal_migration {VERSIONS_BODY}"
+        )
+        select_list = ", ".join(
+            [*copied, *(f"{value} AS {name}" for name, value in new_only.items())]
+        )
+        conn.execute(
+            f"""
+            INSERT INTO versions_withdrawal_migration ({", ".join([*copied, *new_only])})
+            SELECT {select_list} FROM versions
+            """
+        )
+        conn.execute("DROP TABLE versions")
+        conn.execute(
+            "ALTER TABLE versions_withdrawal_migration RENAME TO versions"
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_versions_date_status
+                ON versions (dataset_date, status, version_no DESC)
+            """
+        )
+        conn.commit()
+    except BaseException:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db(database: str | Path) -> None:
     Path(database).parent.mkdir(parents=True, exist_ok=True)
     last_error: sqlite3.Error | None = None
@@ -71,6 +220,12 @@ def init_db(database: str | Path) -> None:
         conn = connect(database)
         try:
             conn.executescript(SCHEMA)
+            # executescript may leave an implicit transaction open; the
+            # migration needs explicit BEGIN/COMMIT control.
+            if conn.in_transaction:
+                conn.commit()
+            if _versions_table_needs_migration(conn):
+                _migrate_versions_table(conn)
             return
         except sqlite3.OperationalError as exc:
             # Multiple gunicorn workers may initialise at the same moment.

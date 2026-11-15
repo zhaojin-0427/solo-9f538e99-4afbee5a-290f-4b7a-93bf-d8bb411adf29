@@ -9,6 +9,8 @@
         <span class="badge badge-published">已发布</span> 当前对外版本
       {% elif version.status == 'candidate' %}
         <span class="badge badge-candidate">待发布候选</span> 尚未对外可见
+      {% elif version.status == 'withdrawn' %}
+        <span class="badge badge-withdrawn">已撤回</span> 不再对外提供
       {% else %}
         <span class="badge badge-superseded">已被替换</span> 历史版本
       {% endif %}
@@ -17,7 +19,15 @@
 </div>
 
 {% if version.status == 'candidate' %}
-  {% if conflict %}
+  {% if withdrawal_blocked %}
+    <div class="notice error">
+      该日期已撤回：此候选在撤回前形成，不能发布，也不会使该日期重新上线。
+      如需恢复对外，请重新上传并通过校验后发布新版本。
+    </div>
+    <div class="actions">
+      <button class="btn" type="button" disabled>发布此候选（撤回前形成的候选）</button>
+    </div>
+  {% elif conflict %}
     <div class="notice warn">
       该日期已存在更新版本 v{{ newer.version_no }}（{{ '已发布' if newer.status == 'published' else '待发布候选' }}）。
       发布此旧候选将被拒绝，请改为发布该日期的最新候选。
@@ -40,11 +50,48 @@
     <a class="btn" href="{{ url_for('public.version_detail', version_id=version.id) }}">查看对外页面</a>
     <a class="btn secondary" href="{{ url_for('public.download', version_id=version.id) }}">下载原始文件</a>
   </div>
+  <div class="card" style="margin-top:1rem; border-color:#f3c1bc">
+    <h2>撤回该日期数据</h2>
+    <p class="small muted">
+      撤回后该日期将从公开列表消失，明细与原始文件下载均不再提供；本版本、原始文件与撤回原因仍保留在后台。
+      撤回前形成的候选不会使该日期重新上线，恢复对外只能重新上传并发布新版本。
+    </p>
+    <form method="post" action="{{ url_for('admin.withdraw', version_id=version.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="reason">撤回原因</label>
+        <input id="reason" type="text" name="reason" maxlength="500" required
+               placeholder="例如：原始文件来源有误，需停止对外提供">
+        <span class="hint">原因会记录在后台审计信息中，必填，最多 500 个字符。</span>
+      </div>
+      <div class="actions" style="margin-top:0.75rem">
+        <button class="btn danger" type="submit">确认撤回当前发布版本</button>
+      </div>
+    </form>
+  </div>
+{% elif version.status == 'withdrawn' %}
+  <div class="notice error">
+    该版本已撤回，不再对外提供。撤回前形成的候选不能使该日期重新上线；如需恢复，请重新上传并通过校验后发布新版本。
+  </div>
+  {% if withdrawal %}
+  <div class="card">
+    <dl class="meta">
+      <dt>撤回原因</dt><dd>{{ withdrawal.reason }}</dd>
+      <dt>撤回时间</dt><dd>{{ withdrawal.withdrawn_at | datetime_local }}</dd>
+    </dl>
+  </div>
+  {% endif %}
+  {% if current_published %}
+  <div class="notice warn">
+    该日期当前已有新的发布版本 v{{ current_published.version_no }}。
+    <a href="{{ url_for('admin.candidate_detail', version_id=current_published.id) }}">查看当前发布版本</a>
+  </div>
+  {% endif %}
 {% endif %}
 
 {% if version.status != 'published' %}
 <div class="actions" style="margin-top:0.75rem">
-  <a class="btn secondary" href="{{ url_for('admin.admin_download', version_id=version.id) }}">下载候选原始文件</a>
+  <a class="btn secondary" href="{{ url_for('admin.admin_download', version_id=version.id) }}">下载原始文件（后台）</a>
 </div>
 {% endif %}
 
@@ -59,6 +106,8 @@
     <dt>创建时间</dt><dd>{{ version.created_at | datetime_local }}</dd>
     {% if version.published_at %}<dt>发布时间</dt><dd>{{ version.published_at | datetime_local }}</dd>{% endif %}
     {% if version.superseded_at %}<dt>替换时间</dt><dd>{{ version.superseded_at | datetime_local }}</dd>{% endif %}
+    {% if version.withdrawn_at %}<dt>撤回时间</dt><dd>{{ version.withdrawn_at | datetime_local }}</dd>{% endif %}
+    {% if version.withdrawal_reason %}<dt>撤回原因</dt><dd>{{ version.withdrawal_reason }}</dd>{% endif %}
   </dl>
 </div>
 

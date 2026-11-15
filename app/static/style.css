@@ -123,6 +123,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .badge-published { background: var(--ok-soft); color: var(--ok); border-color: #b8dfc8; }
 .badge-candidate { background: var(--warn-soft); color: var(--warn); border-color: #efd79a; }
 .badge-superseded { background: #eef1f0; color: var(--muted); border-color: #dde4e2; }
+.badge-withdrawn { background: var(--danger-soft); color: var(--danger); border-color: #f3c1bc; }
 .badge-version { background: var(--accent-soft); color: var(--accent-strong); border-color: #b9dfd3; }
 
 .btn {

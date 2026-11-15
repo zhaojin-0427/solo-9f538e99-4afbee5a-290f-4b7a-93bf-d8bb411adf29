@@ -507,3 +507,346 @@ def test_extra_column_does_not_break_validation(client, app):
     public = client.get("/admin/versions/%d" % version["id"])
     assert public.status_code == 200
     assert "东闸断面" in public.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
+# Withdrawal
+# ---------------------------------------------------------------------------
+
+
+def publish_first(client, app):
+    upload(client, make_csv(VALID_ROWS))
+    version = version_rows(app)[0]
+    client.post(f"/admin/versions/{version['id']}/publish")
+    assert version_rows(app)[0]["status"] == "published"
+    return version
+
+
+def withdraw_rows(app):
+    conn = connect(app.config["DATABASE"])
+    try:
+        return conn.execute("SELECT * FROM withdrawals ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+def test_withdraw_takes_date_offline_but_keeps_backend_record(client, app):
+    version = publish_first(client, app)
+    assert client.get("/datasets/2026-11-14").status_code == 302
+
+    response = client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "原始文件来源有误"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "已撤回" in response.get_data(as_text=True)
+
+    # Public entry points stop offering the date.
+    listing = client.get("/").get_data(as_text=True)
+    assert "2026-11-14" not in listing
+    assert client.get("/datasets/2026-11-14").status_code == 404
+    assert client.get(f"/versions/{version['id']}").status_code == 404
+    assert client.get(f"/versions/{version['id']}/download").status_code == 404
+
+    # The version, file and reason remain available in the admin console.
+    row = version_rows(app)[0]
+    assert row["status"] == "withdrawn"
+    assert row["withdrawn_at"]
+    assert row["withdrawal_reason"] == "原始文件来源有误"
+    detail = client.get(f"/admin/versions/{version['id']}")
+    assert detail.status_code == 200
+    body = detail.get_data(as_text=True)
+    assert "原始文件来源有误" in body
+    assert "已撤回" in body
+    download = client.get(f"/admin/versions/{version['id']}/download")
+    assert download.status_code == 200
+    assert download.data == make_csv(VALID_ROWS)
+
+    records = withdraw_rows(app)
+    assert len(records) == 1
+    assert records[0]["version_id"] == version["id"]
+    assert records[0]["reason"] == "原始文件来源有误"
+
+
+def test_withdraw_requires_reason(client, app):
+    version = publish_first(client, app)
+    for reason in ("", "   "):
+        response = client.post(
+            f"/admin/versions/{version['id']}/withdraw",
+            data={"reason": reason},
+            follow_redirects=True,
+        )
+        assert "请填写撤回原因" in response.get_data(as_text=True)
+    assert version_rows(app)[0]["status"] == "published"
+    assert withdraw_rows(app) == []
+
+
+def test_repeated_withdraw_does_not_add_records(client, app):
+    version = publish_first(client, app)
+    client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "第一次撤回"},
+    )
+    response = client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "重复撤回"},
+        follow_redirects=True,
+    )
+    assert "已经撤回" in response.get_data(as_text=True)
+    records = withdraw_rows(app)
+    assert len(records) == 1
+    assert records[0]["reason"] == "第一次撤回"
+    assert version_rows(app)[0]["withdrawal_reason"] == "第一次撤回"
+
+
+def test_candidate_formed_before_withdrawal_cannot_revive_date(client, app):
+    version = publish_first(client, app)
+
+    # A candidate exists before the withdrawal is recorded.
+    upload(
+        client,
+        make_csv(
+            VALID_ROWS
+            + [("2026-11-14", "西渡断面", "pH", "2026-11-14 14:00:00", "7.28")]
+        ),
+    )
+    stale_candidate = version_rows(app)[1]
+    assert stale_candidate["status"] == "candidate"
+
+    client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "原始文件来源有误"},
+    )
+
+    response = client.post(
+        f"/admin/versions/{stale_candidate['id']}/publish",
+        follow_redirects=True,
+    )
+    body = response.get_data(as_text=True)
+    assert "撤回前形成的候选不能发布" in body
+    rows = {row["id"]: row for row in version_rows(app)}
+    assert rows[stale_candidate["id"]]["status"] == "candidate"
+    assert rows[version["id"]]["status"] == "withdrawn"
+    assert client.get("/datasets/2026-11-14").status_code == 404
+    assert client.get("/").get_data(as_text=True).find("2026-11-14") == -1
+
+    # The candidate detail page makes the block visible before submitting.
+    page = client.get(f"/admin/versions/{stale_candidate['id']}")
+    assert "此候选在撤回前形成" in page.get_data(as_text=True)
+
+
+def test_reupload_after_withdrawal_can_restore_date(client, app):
+    version = publish_first(client, app)
+    client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "原始文件来源有误"},
+    )
+
+    # Recovery is only via a fresh upload + publish.
+    upload(
+        client,
+        make_csv(
+            VALID_ROWS
+            + [("2026-11-14", "西渡断面", "pH", "2026-11-14 14:00:00", "7.28")]
+        ),
+    )
+    fresh = version_rows(app)[1]
+    response = client.post(
+        f"/admin/versions/{fresh['id']}/publish", follow_redirects=True
+    )
+    assert response.status_code == 200
+    rows = {row["id"]: row for row in version_rows(app)}
+    assert rows[fresh["id"]]["status"] == "published"
+    assert rows[version["id"]]["status"] == "withdrawn"
+    assert client.get("/datasets/2026-11-14").status_code == 302
+    assert client.get(f"/versions/{fresh['id']}").status_code == 200
+    assert client.get(f"/versions/{version['id']}").status_code == 404
+
+
+def test_withdrawn_version_cannot_be_republished(client, app):
+    version = publish_first(client, app)
+    client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "来源有误"},
+    )
+    response = client.post(
+        f"/admin/versions/{version['id']}/publish", follow_redirects=True
+    )
+    assert "已撤回" in response.get_data(as_text=True)
+    assert version_rows(app)[0]["status"] == "withdrawn"
+    assert client.get(f"/versions/{version['id']}").status_code == 404
+
+
+def test_stale_withdraw_page_conflicts_without_changing_public_version(client, app):
+    first = publish_first(client, app)
+
+    new_rows = VALID_ROWS + [
+        ("2026-11-14", "西渡断面", "pH", "2026-11-14 14:00:00", "7.28"),
+    ]
+    upload(client, make_csv(new_rows))
+    second = version_rows(app)[1]
+    client.post(f"/admin/versions/{second['id']}/publish")
+
+    # The admin page for v1 is now stale; submitting its withdrawal form must
+    # not remove the newly published v2.
+    response = client.post(
+        f"/admin/versions/{first['id']}/withdraw",
+        data={"reason": "基于旧页面"},
+        follow_redirects=True,
+    )
+    assert "页面已过期" in response.get_data(as_text=True)
+
+    rows = {row["id"]: row for row in version_rows(app)}
+    assert rows[first["id"]]["status"] == "superseded"
+    assert rows[second["id"]]["status"] == "published"
+    assert withdraw_rows(app) == []
+    assert client.get(f"/versions/{second['id']}").status_code == 200
+    assert client.get("/datasets/2026-11-14").status_code == 302
+
+
+def test_withdraw_candidate_is_rejected(client, app):
+    upload(client, make_csv(VALID_ROWS))
+    candidate = version_rows(app)[0]
+    response = client.post(
+        f"/admin/versions/{candidate['id']}/withdraw",
+        data={"reason": "误操作"},
+        follow_redirects=True,
+    )
+    assert "只有当前发布版本可以撤回" in response.get_data(as_text=True)
+    assert version_rows(app)[0]["status"] == "candidate"
+    assert withdraw_rows(app) == []
+
+
+def test_withdraw_requires_csrf_when_enabled(tmp_path):
+    application = create_app(
+        {
+            "DATA_DIR": str(tmp_path),
+            "DATABASE": str(tmp_path / "t.db"),
+            "FILES_DIR": str(tmp_path / "files"),
+            "SECRET_KEY": "s",
+        }
+    )
+    client = application.test_client()
+    response = client.post(
+        "/admin/versions/1/withdraw",
+        data={"reason": "x"},
+    )
+    assert response.status_code == 400
+
+
+def test_failed_withdraw_commit_keeps_public_version(client, app, monkeypatch):
+    version = publish_first(client, app)
+
+    from app import db as db_module
+
+    class FailingCommitConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def commit(self):
+            raise sqlite3.OperationalError("simulated commit failure")
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    real_connect = db_module.connect
+
+    def failing_connect(database):
+        return FailingCommitConnection(real_connect(database))
+
+    monkeypatch.setattr(db_module, "connect", failing_connect)
+    response = client.post(
+        f"/admin/versions/{version['id']}/withdraw",
+        data={"reason": "来源有误"},
+        follow_redirects=True,
+    )
+    assert "数据库提交失败" in response.get_data(as_text=True)
+
+    row = version_rows(app)[0]
+    assert row["status"] == "published"
+    assert row["withdrawn_at"] is None
+    assert withdraw_rows(app) == []
+    assert client.get("/datasets/2026-11-14").status_code == 302
+    assert client.get(f"/versions/{version['id']}").status_code == 200
+    assert client.get(f"/versions/{version['id']}/download").status_code == 200
+
+
+def test_old_database_is_migrated_for_withdrawals(tmp_path):
+    database = tmp_path / "legacy.db"
+    conn = sqlite3.connect(database)
+    conn.executescript(
+        """
+        CREATE TABLE versions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_date      TEXT    NOT NULL,
+            version_no        INTEGER NOT NULL,
+            status            TEXT    NOT NULL DEFAULT 'candidate'
+                                      CHECK (status IN ('candidate', 'published', 'superseded')),
+            original_filename TEXT    NOT NULL,
+            stored_path       TEXT    NOT NULL,
+            sha256            TEXT    NOT NULL,
+            size_bytes        INTEGER NOT NULL,
+            row_count         INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT    NOT NULL,
+            published_at      TEXT,
+            superseded_at     TEXT,
+            UNIQUE (dataset_date, version_no)
+        );
+        CREATE TABLE observations (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id    INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+            row_no        INTEGER NOT NULL,
+            site          TEXT    NOT NULL,
+            metric        TEXT    NOT NULL,
+            observed_at   TEXT    NOT NULL,
+            observed_date TEXT    NOT NULL,
+            value         REAL    NOT NULL,
+            value_text    TEXT    NOT NULL,
+            UNIQUE (version_id, site, metric, observed_at)
+        );
+        INSERT INTO versions (
+            dataset_date, version_no, status, original_filename,
+            stored_path, sha256, size_bytes, row_count, created_at, published_at
+        ) VALUES ('2026-11-14', 1, 'published', 'old.csv',
+                  '2026-11-14/abc.csv', 'abc', 10, 1, '2026-11-14T00:00:00+00:00',
+                  '2026-11-14T00:00:00+00:00');
+        INSERT INTO observations (
+            version_id, row_no, site, metric, observed_at, observed_date,
+            value, value_text
+        ) VALUES (1, 2, '东闸断面', '氨氮', '2026-11-14 08:00:00',
+                  '2026-11-14', 1.2, '1.2');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    application = create_app(
+        {
+            "TESTING": True,
+            "DATA_DIR": str(tmp_path),
+            "DATABASE": str(database),
+            "FILES_DIR": str(tmp_path / "files"),
+            "SECRET_KEY": "t",
+            "CSRF_ENABLED": False,
+        }
+    )
+    conn = connect(database)
+    try:
+        version = conn.execute("SELECT * FROM versions").fetchone()
+        assert version["status"] == "published"
+        assert version["withdrawal_seq"] == 0
+        assert version["withdrawal_reason"] is None
+        assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM withdrawals").fetchone()[0] == 0
+        # The widened status constraint accepts withdrawals after migration.
+        conn.execute(
+            "UPDATE versions SET status = 'withdrawn' WHERE id = 1"
+        )
+    finally:
+        conn.close()
+
+    client = application.test_client()
+    assert client.get("/versions/1").status_code == 404
+    assert client.get("/").status_code == 200
+
